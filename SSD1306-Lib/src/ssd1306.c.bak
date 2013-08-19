@@ -1,0 +1,332 @@
+/*
+ * ssd1306.c
+ *
+ *  Created on: Jun 23, 2012
+ *      Author: taylor
+ */
+
+#include <stdio.h>
+
+#include <linux/spi/spidev.h>
+#include <sys/types.h>
+#include <sys/ioctl.h>
+#include <fcntl.h>
+#include <errno.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+
+// User-defined headers
+#include "font.h"
+#include "beagle_gpio.h"
+
+// Index assignment for gpio struct
+#define RST 0
+#define DC 1
+
+unsigned char spi_bytes[8];
+
+int c_spi_write(unsigned char* bytes, unsigned int length) {
+    int fd; // I tested with a persistent filehandle; no real difference.
+    int ret;
+
+    // for debugging:
+    // for (i=0; i < length; i++) {
+    //    printf("%x ", bytes[i]);
+    // }
+    // printf("\n");
+
+    // See /usr/include/linux/spi/spidev.h for documentation..
+
+    fd = open("/dev/spidev2.0", O_RDWR);
+    if (fd == -1) {
+        perror("Error opening /dev/spidev2.0");
+        exit(2);
+    }
+
+    u_int8_t bits = 8;
+    u_int16_t delay = 0;
+    // 20 MHz seems to work nicely, but maybe some controllers will want
+    // slower speeds? Adjust downwards if you encounter trouble.
+    u_int32_t speed = 20000000;
+    // uint8_t tx[4096];
+
+    struct spi_ioc_transfer tr = {
+        .tx_buf = (unsigned long)bytes,
+        .rx_buf = (unsigned long)NULL,
+        .len = length,
+        .delay_usecs = delay,
+        .speed_hz = speed,
+        .bits_per_word = bits,
+    };
+
+    ret = ioctl(fd, SPI_IOC_MESSAGE(1), &tr);
+    if (ret == -1) {
+        perror("failed to send SPI");
+        exit(2);
+    }
+    if (close(fd) == -1) {
+        perror("failed to close SPI fiehandle");
+        exit(2);
+    }
+    return ret;
+}
+
+/**************************************************************
+ * Name: init_display
+ * 
+ * Description: Initializes SSD1306 OLED display after power-up
+ * 
+ * @param struct gpioID selected_GPIOs[]
+ * 
+ * Returns: nothing
+ * ************************************************************/
+void init_display(struct gpioID selected_GPIOs[]) {
+
+	unsigned char init_chars[] = {0xAE, 0xD5, 0x80, 0xA8, 0x1F, 0xD3, 0x00, 0x8D, 0x14, 0xDA, 0x02, 0x81,
+			              	  	  0x8F, 0xD9, 0xF1, 0xDB, 0x40, 0x20, 0x00, 0x22, 0x00, 0x03, 0xA4, 0xAF};
+  
+				      
+	printf("Resetting OLED Display...\n");
+	// Reset display (active low)
+	write_GPIO_value(selected_GPIOs[RST].GPIONUMBER, 1);
+	sleep(1);
+	write_GPIO_value(selected_GPIOs[RST].GPIONUMBER, 0);
+	sleep(1);
+	write_GPIO_value(selected_GPIOs[RST].GPIONUMBER, 1);
+	printf("Reset Complete!\n");
+
+	// Send SPI command bytes
+	
+	// set D/C bit low for command
+	write_GPIO_value(selected_GPIOs[DC].GPIONUMBER, 0);
+	c_spi_write(init_chars, sizeof(init_chars));
+	
+	return;
+}
+ 
+/**************************************************************
+ * Name: set_display
+ * 
+ * Description: sets display background/inversion parameter
+ * 
+ * @param struct gpioID selected_GPIOs[]
+ * @param val (0 = black background, 1 = white background)
+ * 
+ * Returns: nothing
+ * ************************************************************/
+void set_display(struct gpioID selected_GPIOs[], int val) {
+
+	// Set D/C bit low for command
+	write_GPIO_value(selected_GPIOs[DC].GPIONUMBER, 0);
+
+	if ( val == 1) { //  invert display
+		spi_bytes[0] = 0xA7;
+		c_spi_write(spi_bytes, 1);
+	}
+	else { // normal display
+		spi_bytes[0] = 0xA6;
+		c_spi_write(spi_bytes, 1);
+	}
+	return;
+}
+
+/**************************************************************
+ * Name: clear_display
+ * 
+ * Description: writes an array of 0x00 chars to display to clear
+ * 				static after initialization
+ * 
+ * @param struct gpioID selected_GPIOs[]
+ * 
+ * Returns: nothing
+ * ************************************************************/
+void clear_display(struct gpioID selected_GPIOs[]) {
+      int i, j;
+  
+      // Set D/C bit high for data
+      write_GPIO_value(selected_GPIOs[DC].GPIONUMBER, 1);
+      
+      for(i=0;i<64;i++) { // 4 lines, 16 characters per line
+	  for(j=0;j<8;j++) {
+	      spi_bytes[j] = oledchars[0][j];
+	  }
+	  c_spi_write(spi_bytes, 8);
+      }
+}
+
+/**************************************************************
+ * Name: print_char
+ * 
+ * Description: writes a single character to SSD1306 display
+ * 
+ * @param struct gpioID selected_GPIOs[]
+ * @param data (character to write to display)
+ * @param pos (valid entries are 0 - 63, 4 lines of 16 chars ea.)
+ * 
+ * Notes: 	OLED Display is 128 x 32, each character is 8 x 8
+ * 			Position 0 = Line 0, Position 0
+ * 			Position 16 = Line 1, Position 0
+ * 			Position 63 = Line 3, Position 15
+ * 
+ * Returns: nothing
+ * ************************************************************/
+void print_char(struct gpioID selected_GPIOs[], unsigned char data, int pos){
+
+	int i;
+	unsigned char temp;
+
+	// Send character position command(s)
+	write_GPIO_value(selected_GPIOs[DC].GPIONUMBER, 0); // D/C bit low for command
+
+	// Set Column Start/End Addresses
+	spi_bytes[0] = 0x21; // Set Column Address command
+	temp = (pos*8) - ((pos/16)*128); // e.g. 50 = 400 - 384 = 16
+    spi_bytes[1] = temp; // Column Start Address
+	spi_bytes[2] = (temp + 8); // Column End Address
+	c_spi_write(spi_bytes, 3);	
+
+	// Set Page Start/End Addresses
+	spi_bytes[0] = 0x22;
+	temp = pos/16;
+	spi_bytes[1] = temp; // Page Start Address
+	spi_bytes[2] = 0x03; // Page End Address
+	c_spi_write(spi_bytes, 3);
+	
+	// Send data
+	write_GPIO_value(selected_GPIOs[DC].GPIONUMBER, 1); // D/C bit high for data
+	for(i = 0;i < 8;i++){ // assign data bytes
+		spi_bytes[i] = oledchars[data][i];
+	}
+	c_spi_write(spi_bytes, 8);
+
+	return;
+}
+
+
+/**************************************************************
+ * Name: print_line
+ * 
+ * Description: writes an entire line to the SSD1306 display
+ * 
+ * @param struct gpioID selected_GPIOs[]
+ * @param line (line of text to write to display)
+ * @param num (valid entries are 0 - 3 since there are 4 lines)
+ * 
+ * Returns: nothing
+ * ************************************************************/
+void print_line(struct gpioID selected_GPIOs[], char *line, int num) {
+
+	int i,j;
+	unsigned char data;
+	int length = (int)strlen(line);
+
+	// Send line position command
+	write_GPIO_value(selected_GPIOs[DC].GPIONUMBER, 0); // D/C bit low for command
+	
+	// Set Column Start/End Addresses since they don't depend on the line number (i.e. 0 --> 127)
+	spi_bytes[0] = 0x21; // Set Column Address command
+	spi_bytes[1] = 0x00; // Column Start Address = 0
+	spi_bytes[2] = 0x7F; // Column End Address = 127
+
+	c_spi_write(spi_bytes, 3); // send column start/end address command
+
+	// Set Page Start/End Addresses (this is dependent on line number)
+	spi_bytes[0] = 0x22;
+
+	if ( num == 0) {
+		spi_bytes[1] = 0x00; // Page Start Address = 0
+		spi_bytes[2] = 0x03; // Page End Address = 3
+	}
+	else if ( num == 1 ) {
+		spi_bytes[1] = 0x01; // Page Start Address = 1
+		spi_bytes[2] = 0x03; // Page End Address = 3
+	}
+	else if ( num == 2 ) {
+		spi_bytes[1] = 0x02; // Page Start Address = 2
+		spi_bytes[2] = 0x03; // Page End Address = 3
+	}
+	else {
+		spi_bytes[1] = 0x03; // Page Start Address = 3
+		spi_bytes[2] = 0x03; // Page End Address = 3
+	}
+	c_spi_write(spi_bytes, 3); // send page start/end address command
+
+	// Send data
+	write_GPIO_value(selected_GPIOs[DC].GPIONUMBER, 1); // D/C bit high for data
+	for(i = 0;i < length;i++){
+		data = line[i];
+		for(j = 0;j < 8;j++) {
+			spi_bytes[j] = oledchars[data][j];
+		}
+		c_spi_write(spi_bytes, 8);
+	}
+
+	// Fill rest of the line with blank data
+	for(i = 0;i < (16-length);i++) {
+		data = 0;
+		for(j = 0;j < 8;j++) {
+			spi_bytes[j] = oledchars[data][j];
+		}
+		c_spi_write(spi_bytes, 8);
+	}
+
+	return;
+}
+
+/* ENTRY POINT */
+int main (int argc, char *argv[]){
+
+	int i;
+
+	//Specifies which gpio pins we are going to use
+	int selectedPins[]={P9_15, P9_16};
+	//A little description for each of the selectedPins[].
+	//This makes debugging a LOT easier...
+	const char *pinDescription[] = {"P9_15 RST#", "P9_16 D/C#"};
+
+	//these three lines initialize all the selected pins - need to do this regardless of what parameter is passed
+	//in order to have access to the D/C GPIO pin
+	int nbr_selectedPins=sizeof(selectedPins)/sizeof(*selectedPins);
+	struct gpioID enabled_gpio[nbr_selectedPins];
+
+	// Parse command-line options, assume no errors since no one else in the world will be using this application
+	for (i=1;i<argc;i++) {// start at index 1 because 0 is name of application
+		if ( strcmp(argv[i], "--init") == 0) {
+			initialize_each_enabled_gpio(enabled_gpio,selectedPins,nbr_selectedPins, "full");
+			// display information regarding the GPIO pins
+			display_each_enabled_gpio(enabled_gpio,nbr_selectedPins,pinDescription);
+			init_display(enabled_gpio);
+			clear_display(enabled_gpio);
+			break;
+		}
+		else if ( strcmp(argv[i], "--cleanup") == 0) { // cleanup GPIO pins
+			initialize_each_enabled_gpio(enabled_gpio,selectedPins,nbr_selectedPins, "soft");
+		 	//we should now tell the OS that we are done with the GPIOs
+			cleanup_GPIO(enabled_gpio,selectedPins,nbr_selectedPins);
+			break;
+		}
+		else if ( strcmp(argv[i], "--line") == 0) { // argv[2] = text, argv[3] = line number
+			initialize_each_enabled_gpio(enabled_gpio,selectedPins,nbr_selectedPins, "soft");
+			print_line(enabled_gpio, argv[2], atoi(argv[3])); // atoi converts string to integer
+			break;
+		}
+		else if ( strcmp(argv[i], "--char") == 0) {	// argv[2][0] = character, argv[3] = character position
+			initialize_each_enabled_gpio(enabled_gpio,selectedPins,nbr_selectedPins, "soft");
+			print_char(enabled_gpio, argv[2][0], atoi(argv[3]));
+			break;
+		}
+		else if ( strcmp(argv[i], "--display") == 0) { // set display 0 = normal, 1 = invert
+			initialize_each_enabled_gpio(enabled_gpio,selectedPins,nbr_selectedPins, "soft");
+			set_display(enabled_gpio, atoi(argv[2]));
+			break;
+		}
+		else
+			printf ("Error: Invalid Argument\n");
+	}
+	
+	return 0;
+}
+
+
